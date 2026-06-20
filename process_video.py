@@ -1,94 +1,125 @@
-import os
-import sys
-import asyncio
-import subprocess
-import json
-import requests
-import traceback
-import time
-import math
-import random
+import os, sys, asyncio, subprocess, json, requests, traceback, time, math
 from telethon import TelegramClient
 from telethon.tl import types
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-API_ID            = os.environ.get("API_ID", "0")
-API_HASH          = os.environ.get("API_HASH", "")
-BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
-VIDEO_URL         = os.environ.get("VIDEO_URL", "")
-TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID", "0")
-PHOTO_CAPTION     = os.environ.get("PHOTO_CAPTION", "auto")
-VIDEO_CAPTION     = os.environ.get("VIDEO_CAPTION", "auto")
-NUM_PHOTOS        = os.environ.get("NUM_PHOTOS", "auto")
-POST_MODE         = os.environ.get("POST_MODE", "auto")
-CHAT_ID           = os.environ.get("CHAT_ID", "")
-WORKER_URL        = os.environ.get("WORKER_URL", "")
-WORKFLOW_NAME     = os.environ.get("WORKFLOW_NAME", "V1")
-SKIP_WATERMARK    = os.environ.get("SKIP_WATERMARK", "false").lower() == "true"
-TASK_ID           = os.environ.get("TASK_ID", "")
+API_ID            = os.environ.get("API_ID","0")
+API_HASH          = os.environ.get("API_HASH","")
+BOT_TOKEN         = os.environ.get("BOT_TOKEN","")
+VIDEO_URL         = os.environ.get("VIDEO_URL","")
+TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID","0")
+PHOTO_CAPTION     = os.environ.get("PHOTO_CAPTION","auto")
+VIDEO_CAPTION     = os.environ.get("VIDEO_CAPTION","auto")
+NUM_PHOTOS        = os.environ.get("NUM_PHOTOS","auto")
+POST_MODE         = os.environ.get("POST_MODE","auto")
+CHAT_ID           = os.environ.get("CHAT_ID","")
+WORKER_URL        = os.environ.get("WORKER_URL","")
+WORKFLOW_NAME     = os.environ.get("WORKFLOW_NAME","V1")
+TASK_ID           = os.environ.get("TASK_ID","")
+CHANNEL_ALIAS     = os.environ.get("CHANNEL_ALIAS","default")
+PH_COOKIES_B64    = os.environ.get("PH_COOKIES_B64","")
 
-CF_ACCOUNT_ID     = os.environ.get("CF_ACCOUNT_ID", "")
-CF_AUTH_EMAIL     = os.environ.get("CF_AUTH_EMAIL", "")
-CF_AUTH_KEY       = os.environ.get("CF_AUTH_KEY", "")
-CF_AI_MODEL       = os.environ.get("CF_AI_MODEL", "@cf/aisingapore/gemma-sea-lion-v4-27b-it")
-
-PH_COOKIES_B64    = os.environ.get("PH_COOKIES_B64", "")
+CF_ACCOUNT_ID     = os.environ.get("CF_ACCOUNT_ID","")
+CF_AUTH_EMAIL     = os.environ.get("CF_AUTH_EMAIL","")
+CF_AUTH_KEY       = os.environ.get("CF_AUTH_KEY","")
+CF_AI_MODEL       = os.environ.get("CF_AI_MODEL","@cf/aisingapore/gemma-sea-lion-v4-27b-it")
 
 SUPABASE_URL      = "https://guotpdwaswaybjiiezax.supabase.co"
-SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_KEY      = os.environ.get("SUPABASE_KEY","")
 
 MAX_FILE_SIZE_MB  = 2000
 
-# ── Channel ID parse ──────────────────────────────────────────────────────────
 def parse_channel_id(raw):
     raw = raw.strip()
     try:
-        if raw.startswith("-100"): return int(raw)
-        elif raw.lstrip("-").isdigit(): return int(raw)
-        else: raise ValueError
+        return int(f"-100{raw}") if raw.isdigit() else int(raw)
     except ValueError:
-        print(f"❌ Invalid TARGET_CHANNEL_ID: '{raw}'")
-        sys.exit(1)
+        print(f"❌ Invalid TARGET_CHANNEL_ID: '{raw}'"); sys.exit(1)
 
 CHANNEL_ID = parse_channel_id(TARGET_CHANNEL_ID)
 
 # ── Supabase Helpers ──────────────────────────────────────────────────────────
 def sb_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal"
-    }
+    return {"apikey":SUPABASE_KEY,"Authorization":f"Bearer {SUPABASE_KEY}","Content-Type":"application/json","Prefer":"return=minimal"}
 
 def sb_update_task(task_id, status, error_msg=None):
-    if not SUPABASE_KEY or not task_id:
-        return
+    if not SUPABASE_KEY or not task_id: return
     try:
-        body = {"status": status}
-        if status in ("completed", "failed"):
-            body["end_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        if error_msg:
-            body["error_message"] = error_msg[:500]
-        requests.patch(
-            f"{SUPABASE_URL}/rest/v1/tasks?task_id=eq.{task_id}",
-            headers=sb_headers(), json=body, timeout=10
-        )
-    except Exception as e:
-        print(f"[WARN] sb_update_task: {e}")
+        body = {"status":status}
+        if status in ("completed","failed"): body["end_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+        if error_msg: body["error_message"] = error_msg[:500]
+        requests.patch(f"{SUPABASE_URL}/rest/v1/tasks?task_id=eq.{task_id}",headers=sb_headers(),json=body,timeout=10)
+    except Exception as e: print(f"[WARN] sb_update_task: {e}")
 
 def sb_log(task_id, level, message):
-    if not SUPABASE_KEY or not task_id:
-        return
+    if not SUPABASE_KEY or not task_id: return
+    try: requests.post(f"{SUPABASE_URL}/rest/v1/task_logs",headers=sb_headers(),json={"task_id":task_id,"level":level,"message":message[:500]},timeout=10)
+    except Exception as e: print(f"[WARN] sb_log: {e}")
+
+# ── AI Prompt Fetcher from Supabase ──────────────────────────────────────────
+_prompt_cache = {}
+
+def get_ai_prompt(prompt_type):
+    """
+    Fetch AI prompt template from Supabase ai_prompts table.
+    Priority:
+      1. channel:<CHANNEL_ALIAS>:<type>  (per-channel custom prompt)
+      2. default_<type>_caption          (default prompt)
+      3. Hardcoded fallback
+    """
+    cache_key = f"{CHANNEL_ALIAS}:{prompt_type}"
+    if cache_key in _prompt_cache:
+        return _prompt_cache[cache_key]
+
+    if not SUPABASE_KEY:
+        return _hardcoded_prompt(prompt_type)
+
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/task_logs",
-            headers=sb_headers(),
-            json={"task_id": task_id, "level": level, "message": message[:500]},
-            timeout=10
+        # 1. Channel-specific prompt
+        if CHANNEL_ALIAS and CHANNEL_ALIAS != "default":
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/ai_prompts?name=eq.channel:{CHANNEL_ALIAS}:{prompt_type}&limit=1",
+                headers=hdrs, timeout=10
+            )
+            rows = r.json() if r.status_code == 200 else []
+            if rows:
+                tpl = rows[0]["template"]
+                print(f"[INFO] Custom prompt loaded: channel:{CHANNEL_ALIAS}:{prompt_type}")
+                _prompt_cache[cache_key] = tpl
+                return tpl
+
+        # 2. Default prompt
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ai_prompts?name=eq.default_{prompt_type}_caption&limit=1",
+            headers=hdrs, timeout=10
         )
+        rows = r.json() if r.status_code == 200 else []
+        if rows:
+            tpl = rows[0]["template"]
+            print(f"[INFO] Default prompt loaded: default_{prompt_type}_caption")
+            _prompt_cache[cache_key] = tpl
+            return tpl
+
     except Exception as e:
-        print(f"[WARN] sb_log: {e}")
+        print(f"[WARN] Prompt fetch error: {e}")
+
+    # 3. Hardcoded fallback
+    return _hardcoded_prompt(prompt_type)
+
+def _hardcoded_prompt(prompt_type):
+    if prompt_type == "photo":
+        return (
+            "Video title: {title}\nDescription: {description}\n\n"
+            "ဒီ video အတွက် Burmese (Myanmar) မှာ ဆွဲဆောင်မှုရှိတဲ့ photo caption တစ်ကြောင်း ရေးပေး။ "
+            "Short (2-3 lines), emoji ပါရမယ်၊ hashtag 2-3 ခု ထည့်ပေး။ Caption ကိုပဲ ထုတ်ပေး၊ explanation မပါနဲ့။"
+        )
+    else:
+        return (
+            "Video title: {title}\nDescription: {description}\n\n"
+            "ဒီ video အတွက် Burmese (Myanmar) မှာ viral ဖြစ်တဲ့ video caption တစ်ကြောင်း ရေးပေး။ "
+            "Curious ဖြစ်တဲ့ tone, 3-4 lines, emoji ပါရမယ်၊ hashtag 2-3 ခု ထည့်ပေး။ Caption ကိုပဲ ထုတ်ပေး။"
+        )
 
 # ── Progress Reporter ─────────────────────────────────────────────────────────
 def send_progress(text):
@@ -96,337 +127,245 @@ def send_progress(text):
     print(msg)
     sb_log(TASK_ID, "error" if "❌" in text else "info", text[:400])
     if CHAT_ID and WORKER_URL:
-        try:
-            requests.post(WORKER_URL, json={"chat_id": CHAT_ID, "progress_text": msg, "task_id": TASK_ID}, timeout=10)
-        except Exception:
-            pass
+        try: requests.post(WORKER_URL, json={"chat_id":CHAT_ID,"progress_text":msg,"task_id":TASK_ID}, timeout=10)
+        except: pass
 
 def send_tg(method, payload):
     for _ in range(3):
         try:
-            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-                              json=payload, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
+            r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=15)
+            if r.status_code == 200: return r.json()
+        except: pass
         time.sleep(2)
     return None
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 def preflight_check():
-    required = {"API_ID": API_ID, "API_HASH": API_HASH,
-                "BOT_TOKEN": BOT_TOKEN, "VIDEO_URL": VIDEO_URL}
-    missing = [k for k, v in required.items() if not v or v == "0"]
-    if missing:
-        send_progress(f"❌ Missing secrets: {', '.join(missing)}")
-        sys.exit(1)
-    send_progress("✅ Pre-flight OK")
+    missing = [k for k,v in {"API_ID":API_ID,"API_HASH":API_HASH,"BOT_TOKEN":BOT_TOKEN,"VIDEO_URL":VIDEO_URL}.items() if not v or v=="0"]
+    if missing: send_progress(f"❌ Missing secrets: {', '.join(missing)}"); sys.exit(1)
+    send_progress(f"✅ Pre-flight OK | alias={CHANNEL_ALIAS}")
 
 # ── AI Caption Generation ─────────────────────────────────────────────────────
 def generate_caption(title, description, caption_type="video"):
+    """
+    Fetch prompt template from Supabase (per-channel or default),
+    fill {title}/{description} placeholders, then call Cloudflare Workers AI.
+    """
     if not CF_ACCOUNT_ID or not CF_AUTH_KEY:
+        send_progress(f"⚠️ CF AI env missing — skipping AI caption")
         return None
-    prompt_map = {
-        "photo": (
-            f"Video title: {title}\n"
-            f"Description: {description[:300] if description else 'N/A'}\n\n"
-            "ဒီ video အတွက် Burmese (Myanmar) မှာ ဆွဲဆောင်မှုရှိတဲ့ photo caption တစ်ကြောင်း ရေးပေး။ "
-            "Short (2-3 lines), emoji ပါရမယ်၊ hashtag 2-3 ခု ထည့်ပေး။ Caption ကိုပဲ ထုတ်ပေး၊ explanation မပါနဲ့။"
-        ),
-        "video": (
-            f"Video title: {title}\n"
-            f"Description: {description[:300] if description else 'N/A'}\n\n"
-            "ဒီ video အတွက် Burmese (Myanmar) မှာ viral ဖြစ်တဲ့ video caption တစ်ကြောင်း ရေးပေး။ "
-            "Curious ဖြစ်တဲ့ tone, 3-4 lines, emoji ပါရမယ်၊ hashtag 2-3 ခု ထည့်ပေး။ Caption ကိုပဲ ထုတ်ပေး။"
-        )
-    }
+
+    # Get prompt template (from Supabase or hardcoded fallback)
+    prompt_template = get_ai_prompt(caption_type)
+
+    # Fill placeholders
+    user_prompt = prompt_template.replace("{title}", title or "N/A").replace("{description}", (description or "N/A")[:400])
+
     try:
         r = requests.post(
             f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_AI_MODEL}",
-            headers={"X-Auth-Email": CF_AUTH_EMAIL, "X-Auth-Key": CF_AUTH_KEY, "Content-Type": "application/json"},
-            json={"messages": [
-                {"role": "system", "content": "You are a social media content writer specializing in Burmese (Myanmar) language content."},
-                {"role": "user", "content": prompt_map.get(caption_type, prompt_map["video"])}
+            headers={"X-Auth-Email":CF_AUTH_EMAIL,"X-Auth-Key":CF_AUTH_KEY,"Content-Type":"application/json"},
+            json={"messages":[
+                {"role":"system","content":"You are a social media content writer specializing in Burmese (Myanmar) language content."},
+                {"role":"user","content":user_prompt}
             ]},
-            timeout=30
+            timeout=45
         )
         if r.status_code == 200:
-            caption = r.json().get("result", {}).get("response", "").strip()
+            caption = r.json().get("result",{}).get("response","").strip()
             if caption:
                 send_progress(f"✅ AI caption generated ({caption_type})")
                 return caption
+        else:
+            send_progress(f"⚠️ AI API {r.status_code}: {r.text[:80]}")
     except Exception as e:
-        print(f"[WARN] AI caption error: {e}")
+        send_progress(f"⚠️ AI caption error: {e}")
     return None
 
-# ── Video helpers ─────────────────────────────────────────────────────────────
+# ── Video Helpers ─────────────────────────────────────────────────────────────
 def get_video_info(path):
     try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", "-show_streams", path],
-            capture_output=True, text=True
-        )
+        r = subprocess.run(["ffprobe","-v","quiet","-print_format","json","-show_format","-show_streams",path],capture_output=True,text=True)
         data = json.loads(r.stdout)
         duration = int(float(data["format"]["duration"]))
-        w = h = 0
+        w=h=0
         for s in data["streams"]:
-            if s["codec_type"] == "video":
-                w, h = int(s["width"]), int(s["height"])
-                break
-        return duration, w, h
-    except Exception as e:
-        print(f"ffprobe error: {e}")
-        return 0, 0, 0
+            if s["codec_type"]=="video": w,h=int(s["width"]),int(s["height"]); break
+        return duration,w,h
+    except Exception as e: print(f"ffprobe error:{e}"); return 0,0,0
 
 def capture_screenshot(video_path, time_pos, out_path):
     try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(time_pos), "-i", video_path,
-             "-frames:v", "1", "-update", "1", "-q:v", "2", out_path],
-            check=True, capture_output=True
-        )
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
-    except Exception as e:
-        print(f"Screenshot error at {time_pos}s: {e}")
-        return False
+        subprocess.run(["ffmpeg","-y","-ss",str(time_pos),"-i",video_path,"-frames:v","1","-update","1","-q:v","2",out_path],check=True,capture_output=True)
+        return os.path.exists(out_path) and os.path.getsize(out_path)>0
+    except Exception as e: print(f"Screenshot error at {time_pos}s:{e}"); return False
 
 def smart_num_photos(duration):
-    if NUM_PHOTOS != "auto":
+    if NUM_PHOTOS!="auto":
         try: return int(NUM_PHOTOS)
-        except Exception: pass
-    if duration < 300:    return 2
-    elif duration < 900:  return 4
-    elif duration < 1800: return 6
-    else:                 return 8
+        except: pass
+    if duration<300: return 2
+    elif duration<900: return 4
+    elif duration<1800: return 6
+    else: return 8
 
 def smart_post_mode(size_mb, duration):
-    if POST_MODE != "auto":
-        return POST_MODE
-    if size_mb > 1800 or duration > 1200:
-        return "both"
-    return "video"
+    if POST_MODE!="auto": return POST_MODE
+    return "both" if size_mb>1800 or duration>1200 else "video"
 
 def setup_cookies():
-    if not PH_COOKIES_B64:
-        return None
+    if not PH_COOKIES_B64: return None
     try:
         import base64
         content = base64.b64decode(PH_COOKIES_B64).decode()
         path = "/tmp/ph_cookies.txt"
-        with open(path, "w") as f:
-            f.write(content)
-        send_progress("🍪 Cookies loaded")
-        return path
-    except Exception as e:
-        print(f"Cookies error: {e}")
-        return None
+        open(path,"w").write(content)
+        send_progress("🍪 Cookies loaded"); return path
+    except Exception as e: print(f"Cookies error:{e}"); return None
 
 def download_video(out_path):
     cookies_path = setup_cookies()
-    cookie_args = ["--cookies", cookies_path] if cookies_path else []
-    base = ["yt-dlp", "--merge-output-format", "mp4", "-o", out_path]
+    ck = ["--cookies",cookies_path] if cookies_path else []
+    base = ["yt-dlp","--merge-output-format","mp4","-o",out_path]
     strategies = [
-        base + cookie_args + ["-f", "bestvideo+bestaudio/best", "--impersonate", "chrome", VIDEO_URL],
-        base + cookie_args + [VIDEO_URL],
-        base + [VIDEO_URL],
+        base+ck+["-f","bestvideo+bestaudio/best","--impersonate","chrome",VIDEO_URL],
+        base+ck+[VIDEO_URL],
+        base+[VIDEO_URL],
     ]
-    last_err = ""
-    for i, cmd in enumerate(strategies, 1):
+    last_err=""
+    for i,cmd in enumerate(strategies,1):
         send_progress(f"📥 Download strategy {i}/3...")
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode == 0 and os.path.exists(out_path):
-            send_progress(f"✅ Downloaded (strategy {i})")
-            return True
-        last_err = r.stderr
-        print(f"Strategy {i} failed: {last_err[:200]}")
+        r = subprocess.run(cmd,capture_output=True,text=True)
+        if r.returncode==0 and os.path.exists(out_path):
+            send_progress(f"✅ Downloaded (strategy {i})"); return True
+        last_err=r.stderr; print(f"Strategy {i} failed:{last_err[:150]}")
     raise Exception(f"All download strategies failed:\n{last_err[:300]}")
 
 def get_video_title():
-    cookies_path = "/tmp/ph_cookies.txt" if os.path.exists("/tmp/ph_cookies.txt") else None
-    cookie_args = ["--cookies", cookies_path] if cookies_path else []
-    r = subprocess.run(["yt-dlp", "--get-title"] + cookie_args + [VIDEO_URL], capture_output=True, text=True)
-    title = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else ""
-    desc_r = subprocess.run(["yt-dlp", "--get-description"] + cookie_args + [VIDEO_URL], capture_output=True, text=True)
-    description = desc_r.stdout.strip() if desc_r.returncode == 0 else ""
-    return title or "Premium Video", description
+    ck_path = "/tmp/ph_cookies.txt" if os.path.exists("/tmp/ph_cookies.txt") else None
+    ck = ["--cookies",ck_path] if ck_path else []
+    t = subprocess.run(["yt-dlp","--get-title"]+ck+[VIDEO_URL],capture_output=True,text=True)
+    d = subprocess.run(["yt-dlp","--get-description"]+ck+[VIDEO_URL],capture_output=True,text=True)
+    return (t.stdout.strip() if t.returncode==0 and t.stdout.strip() else "Premium Video"), (d.stdout.strip() if d.returncode==0 else "")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     preflight_check()
-    sb_update_task(TASK_ID, "running")
-    sb_log(TASK_ID, "info", f"Channel manager started — WF: {WORKFLOW_NAME}")
+    sb_update_task(TASK_ID,"running")
+    sb_log(TASK_ID,"info",f"Channel manager started — WF:{WORKFLOW_NAME} alias:{CHANNEL_ALIAS}")
 
-    raw_video   = "raw_video.mp4"
-    final_video = "final_video.mp4"
-    thumbnail   = "thumb.jpg"
-    screenshots = []
-    video_parts = []
+    raw_video="raw_video.mp4"; final_video="final_video.mp4"; thumbnail="thumb.jpg"
+    screenshots=[]; video_parts=[]
 
     try:
         # 1. Download
         download_video(raw_video)
         video_title, video_desc = get_video_title()
         send_progress(f"✅ Downloaded: {video_title}")
-        sb_log(TASK_ID, "info", f"Downloaded: {video_title}")
 
-        # 2. Video info
-        duration, width, height = get_video_info(raw_video)
-        size_mb = os.path.getsize(raw_video) / 1024 / 1024
-
-        # 3. Smart auto-detection
+        # 2. Info
+        duration,width,height = get_video_info(raw_video)
+        size_mb = os.path.getsize(raw_video)/1024/1024
         num_photos = smart_num_photos(duration)
         post_mode  = smart_post_mode(size_mb, duration)
-        send_progress(f"📊 Auto-config: {num_photos} photos, mode={post_mode}, dur={duration//60}min, {size_mb:.0f}MB")
+        send_progress(f"📊 Auto: {num_photos} photos | mode={post_mode} | {duration//60}min | {size_mb:.0f}MB")
 
-        # 4. AI Caption
-        send_progress("🤖 Generating AI captions...")
-        if PHOTO_CAPTION == "auto":
+        # 3. AI Captions (prompt from Supabase)
+        send_progress(f"🤖 Generating captions (alias={CHANNEL_ALIAS})...")
+        if PHOTO_CAPTION=="auto":
             photo_caption = generate_caption(video_title, video_desc, "photo") or f"📸 {video_title}"
         else:
-            photo_caption = PHOTO_CAPTION.replace("{title}", video_title)
-
-        if VIDEO_CAPTION == "auto":
+            photo_caption = PHOTO_CAPTION.replace("{title}",video_title)
+        if VIDEO_CAPTION=="auto":
             video_caption = generate_caption(video_title, video_desc, "video") or f"🎬 {video_title}"
         else:
-            video_caption = VIDEO_CAPTION.replace("{title}", video_title)
+            video_caption = VIDEO_CAPTION.replace("{title}",video_title)
 
-        # 5. Screenshots
+        # 4. Screenshots
         send_progress(f"📸 Capturing {num_photos} screenshots...")
-        if duration > 0:
-            capture_screenshot(raw_video, duration * 0.08, thumbnail)
-            for i in range(1, num_photos + 1):
-                pos = (duration / (num_photos + 1)) * i
+        if duration>0:
+            capture_screenshot(raw_video, duration*0.08, thumbnail)
+            for i in range(1,num_photos+1):
+                pos = (duration/(num_photos+1))*i
                 path = f"screenshot_{i}.jpg"
-                if capture_screenshot(raw_video, pos, path):
-                    screenshots.append(path)
+                if capture_screenshot(raw_video, pos, path): screenshots.append(path)
         send_progress(f"✅ {len(screenshots)} screenshots ready")
 
-        # 6. Process (watermark)
-        if SKIP_WATERMARK:
-            send_progress("⏭️ Watermark skipped")
-            final_video = raw_video
-        else:
-            send_progress("⚙️ Applying watermark...")
-            try:
-                ref_h    = height if height > 0 else 720
-                bar_h    = max(40, int(ref_h * 0.07))
-                font_sz  = max(18, int(bar_h * 0.55))
-                text_y   = max(4, (bar_h - font_sz) // 2)
-                scale_filter = ""
-                if height >= 1080: scale_filter = ",scale=-2:1080"
-                elif height >= 720: scale_filter = ",scale=-2:720"
-                else: scale_filter = ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
-                bar_filter  = f"drawbox=x=0:y=0:w=iw:h={bar_h}:color=black@0.88:t=fill"
-                text_filter = (
-                    f"drawtext=text='    KYAWGYI FAMILYS    ':"
-                    f"x=w-mod(t*55\\,w+tw):y={text_y}:"
-                    f"fontsize={font_sz}:fontcolor=white@0.95"
-                )
-                vf = f"{bar_filter},{text_filter}{scale_filter}"
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", raw_video, "-vf", vf,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart", final_video
-                ], check=True, capture_output=True)
-                send_progress("✅ Watermark applied")
-            except Exception as e:
-                send_progress(f"⚠️ Encode warning: {e} — raw video သုံးမည်")
-                final_video = raw_video
+        # 5. Watermark / encode
+        try:
+            ref_h = height if height>0 else 720
+            bar_h = max(40,int(ref_h*0.07)); font_sz=max(18,int(bar_h*0.55)); text_y=max(4,(bar_h-font_sz)//2)
+            scale=""
+            if height>=1080: scale=",scale=-2:1080"
+            elif height>=720: scale=",scale=-2:720"
+            else: scale=",scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            vf=(f"drawbox=x=0:y=0:w=iw:h={bar_h}:color=black@0.88:t=fill,"
+                f"drawtext=text='    KYAWGYI FAMILYS    ':x=w-mod(t*55\\,w+tw):y={text_y}:fontsize={font_sz}:fontcolor=white@0.95{scale}")
+            subprocess.run(["ffmpeg","-y","-i",raw_video,"-vf",vf,"-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-b:a","128k","-pix_fmt","yuv420p","-movflags","+faststart",final_video],check=True,capture_output=True)
+            send_progress("✅ Watermark applied")
+        except Exception as e:
+            send_progress(f"⚠️ Encode warning — raw video သုံးမည်: {e}")
+            final_video=raw_video
 
-        # 7. Split if > 2GB
-        video_parts = [final_video]
-        final_size_mb = os.path.getsize(final_video) / 1024 / 1024
-        if final_size_mb > MAX_FILE_SIZE_MB:
-            send_progress(f"✂️ Splitting ({final_size_mb:.0f}MB)...")
-            video_parts = []
-            dur, _, _ = get_video_info(final_video)
-            n = math.ceil(final_size_mb / MAX_FILE_SIZE_MB)
-            part_dur = dur / n
+        # 6. Split if >2GB
+        video_parts=[final_video]
+        final_sz = os.path.getsize(final_video)/1024/1024
+        if final_sz>MAX_FILE_SIZE_MB:
+            send_progress(f"✂️ Splitting ({final_sz:.0f}MB)...")
+            video_parts=[]; dur,_,_=get_video_info(final_video); n=math.ceil(final_sz/MAX_FILE_SIZE_MB); pd=dur/n
             for i in range(n):
-                pf = f"part_{i}.mp4"
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", final_video,
-                    "-ss", str(i * part_dur), "-t", str(part_dur),
-                    "-c", "copy", "-movflags", "+faststart", pf
-                ], check=True, capture_output=True)
+                pf=f"part_{i}.mp4"
+                subprocess.run(["ffmpeg","-y","-i",final_video,"-ss",str(i*pd),"-t",str(pd),"-c","copy","-movflags","+faststart",pf],check=True,capture_output=True)
                 video_parts.append(pf)
             send_progress(f"✅ Split into {n} parts")
 
-        # 8. Upload via Telethon
-        send_progress("🚀 Connecting to Telegram...")
-        client = TelegramClient("bot_session", int(API_ID), API_HASH,
-                                connection_retries=None, request_retries=5)
+        # 7. Upload via Telethon
+        send_progress("🚀 Connecting Telegram...")
+        client = TelegramClient("bot_session",int(API_ID),API_HASH,connection_retries=None,request_retries=5)
         await client.start(bot_token=BOT_TOKEN)
 
         async with client:
             thumb = thumbnail if os.path.exists(thumbnail) else None
+            def album_caps(files, last): return [""]*( len(files)-1)+[last]
 
-            def album_caps(files, last_cap):
-                return [""] * (len(files) - 1) + [last_cap]
+            send_progress(f"📤 Uploading mode={post_mode}...")
 
-            send_progress(f"📤 Uploading (mode={post_mode})...")
-
-            if post_mode == "album":
+            if post_mode=="album":
                 if screenshots:
-                    caps = album_caps(screenshots, f"📸 **{video_title}**\n\n{photo_caption}")
-                    await client.send_file(CHANNEL_ID, screenshots, caption=caps, parse_mode="markdown")
+                    await client.send_file(CHANNEL_ID,screenshots,caption=album_caps(screenshots,f"📸 **{video_title}**\n\n{photo_caption}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
 
-            elif post_mode == "both":
+            elif post_mode=="both":
                 if screenshots:
-                    caps = album_caps(screenshots, f"📸 **{video_title}**\n\n{photo_caption}")
-                    await client.send_file(CHANNEL_ID, screenshots, caption=caps, parse_mode="markdown")
+                    await client.send_file(CHANNEL_ID,screenshots,caption=album_caps(screenshots,f"📸 **{video_title}**\n\n{photo_caption}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
-                for i, part in enumerate(video_parts):
-                    dur_p, w_p, h_p = get_video_info(part)
-                    suffix = f" (Part {i+1}/{len(video_parts)})" if len(video_parts) > 1 else ""
-                    cap = f"🎬 **{video_title}{suffix}**\n\n{video_caption}"
-                    await client.send_file(
-                        CHANNEL_ID, part, caption=cap, parse_mode="markdown",
-                        thumb=thumb if i == 0 else None, supports_streaming=True,
-                        attributes=[types.DocumentAttributeVideo(duration=dur_p, w=w_p, h=h_p, supports_streaming=True)]
-                    )
+                for i,part in enumerate(video_parts):
+                    dur_p,w_p,h_p=get_video_info(part)
+                    sfx=f" (Part {i+1}/{len(video_parts)})" if len(video_parts)>1 else ""
+                    await client.send_file(CHANNEL_ID,part,caption=f"🎬 **{video_title}{sfx}**\n\n{video_caption}",parse_mode="markdown",thumb=thumb if i==0 else None,supports_streaming=True,attributes=[types.DocumentAttributeVideo(duration=dur_p,w=w_p,h=h_p,supports_streaming=True)])
                     send_progress(f"✅ Video part {i+1}/{len(video_parts)} uploaded")
 
-            elif post_mode == "video":
-                all_files = screenshots + [video_parts[0]]
-                dur_v, w_v, h_v = get_video_info(video_parts[0])
-                cap = f"🎬 **{video_title}**\n\n{video_caption}"
-                caps = album_caps(all_files, cap)
-                await client.send_file(
-                    CHANNEL_ID, all_files, caption=caps, parse_mode="markdown",
-                    thumb=thumb, supports_streaming=True
-                )
-                send_progress("✅ Video + photos uploaded as group")
-                if len(video_parts) > 1:
-                    for i, part in enumerate(video_parts[1:], 2):
-                        dur_p, w_p, h_p = get_video_info(part)
-                        await client.send_file(
-                            CHANNEL_ID, part,
-                            caption=f"🎬 **{video_title}** (Part {i}/{len(video_parts)})",
-                            parse_mode="markdown", supports_streaming=True,
-                            attributes=[types.DocumentAttributeVideo(duration=dur_p, w=w_p, h=h_p, supports_streaming=True)]
-                        )
-                        send_progress(f"✅ Extra part {i} uploaded")
+            elif post_mode=="video":
+                all_files = screenshots+[video_parts[0]]
+                dur_v,w_v,h_v=get_video_info(video_parts[0])
+                await client.send_file(CHANNEL_ID,all_files,caption=album_caps(all_files,f"🎬 **{video_title}**\n\n{video_caption}"),parse_mode="markdown",thumb=thumb,supports_streaming=True)
+                send_progress("✅ Video+photos uploaded")
+                for i,part in enumerate(video_parts[1:],2):
+                    dur_p,w_p,h_p=get_video_info(part)
+                    await client.send_file(CHANNEL_ID,part,caption=f"🎬 **{video_title}** (Part {i}/{len(video_parts)})",parse_mode="markdown",supports_streaming=True,attributes=[types.DocumentAttributeVideo(duration=dur_p,w=w_p,h=h_p,supports_streaming=True)])
+                    send_progress(f"✅ Extra part {i} uploaded")
 
         send_progress("🎉 All done!")
-        sb_update_task(TASK_ID, "completed")
-        sb_log(TASK_ID, "info", "All uploads completed successfully")
+        sb_update_task(TASK_ID,"completed")
 
     except Exception as e:
-        tb = traceback.format_exc()
         send_progress(f"❌ Error: {str(e)[:200]}")
-        print(f"[ERROR] {tb}")
-        sb_update_task(TASK_ID, "failed", str(e)[:300])
-        sb_log(TASK_ID, "error", f"Fatal error: {str(e)[:300]}")
+        print(f"[ERROR] {traceback.format_exc()}")
+        sb_update_task(TASK_ID,"failed",str(e)[:300])
     finally:
-        for f in [raw_video, final_video, thumbnail] + screenshots + video_parts:
-            if f and os.path.exists(f) and f != raw_video or (f == final_video and final_video != raw_video):
+        for f in [raw_video, final_video if final_video!=raw_video else None, thumbnail]+screenshots+video_parts:
+            if f and os.path.exists(f):
                 try: os.remove(f)
                 except: pass
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__=="__main__": asyncio.run(main())
