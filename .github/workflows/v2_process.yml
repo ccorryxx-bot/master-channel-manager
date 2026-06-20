@@ -2,6 +2,7 @@ name: Channel Manager V2
 on:
   repository_dispatch:
     types: [process_video_v2]
+
 jobs:
   process:
     runs-on: ubuntu-latest
@@ -26,6 +27,7 @@ jobs:
           CF_AUTH_EMAIL: ${{ secrets.CF_AUTH_EMAIL }}
           CF_AUTH_KEY: ${{ secrets.CF_GLOBAL_KEY }}
           CF_AI_MODEL: '@cf/aisingapore/gemma-sea-lion-v4-27b-it'
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TARGET_CHANNEL_ID: ${{ github.event.client_payload.target_channel_id }}
           VIDEO_URL: ${{ github.event.client_payload.video_url }}
           PHOTO_CAPTION: ${{ github.event.client_payload.photo_caption }}
@@ -35,6 +37,8 @@ jobs:
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
           WORKER_URL: ${{ github.event.client_payload.worker_url }}
           TASK_ID: ${{ github.event.client_payload.task_id }}
+          CHANNEL_ALIAS: ${{ github.event.client_payload.channel_alias }}
           WORKFLOW_NAME: 'V2'
           PH_COOKIES_B64: ${{ secrets.PH_COOKIES_B64 }}
         run: python process_video.py
+
