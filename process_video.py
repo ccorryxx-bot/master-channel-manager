@@ -13,7 +13,7 @@ VIDEO_CAPTION     = os.environ.get("VIDEO_CAPTION","auto")
 NUM_PHOTOS        = os.environ.get("NUM_PHOTOS","auto")
 POST_MODE         = os.environ.get("POST_MODE","auto")
 CHAT_ID           = os.environ.get("CHAT_ID","")
-WORKER_URL        = os.environ.get("WORKER_URL","")
+WORKER_URL        = os.environ.get("WORKER_URL","").rstrip("/")
 WORKFLOW_NAME     = os.environ.get("WORKFLOW_NAME","V1")
 TASK_ID           = os.environ.get("TASK_ID","")
 CHANNEL_ALIAS     = os.environ.get("CHANNEL_ALIAS","default")
@@ -41,19 +41,18 @@ CHANNEL_ID = parse_channel_id(TARGET_CHANNEL_ID)
 # ── URL Type Detection ────────────────────────────────────────────────────────
 def is_direct_url(url):
     """
-    Detect presigned/direct file URLs that should be downloaded
-    via requests instead of yt-dlp.
-    Examples: IDrive e2, Backblaze B2, AWS S3, any presigned URL
+    Detect presigned/direct file URLs (IDrive e2, Backblaze B2, AWS S3, etc.)
+    that should be downloaded via requests instead of yt-dlp.
     """
     import re
     if not url:
         return False
     patterns = [
-        r'X-Amz-Signature=',      # AWS/S3/IDrive e2 presigned
+        r'X-Amz-Signature=',
         r'X-Amz-Algorithm=',
         r'\.backblazeb2\.com',
         r'idrivee2',
-        r'\.(mp4|mkv|avi|mov|webm|m4v)(\?|$)',  # direct file extension
+        r'\.(mp4|mkv|avi|mov|webm|m4v)(\?|$)',
         r's3\.[a-z0-9-]+\.amazonaws\.com',
     ]
     return any(re.search(p, url, re.IGNORECASE) for p in patterns)
@@ -124,8 +123,12 @@ def send_progress(text):
     print(msg)
     sb_log(TASK_ID,"error" if "❌" in text else "info",text[:400])
     if CHAT_ID and WORKER_URL:
-        try: requests.post(WORKER_URL,json={"chat_id":CHAT_ID,"progress_text":msg,"task_id":TASK_ID},timeout=10)
-        except: pass
+        try:
+            # FIX Bug 5: use /progress endpoint
+            endpoint = f"{WORKER_URL}/progress"
+            requests.post(endpoint,json={"chat_id":CHAT_ID,"progress_text":msg,"task_id":TASK_ID},timeout=10)
+        except Exception as e:
+            print(f"[WARN] progress push failed: {e}")
 
 # ── AI Caption ────────────────────────────────────────────────────────────────
 def generate_caption(title, description, caption_type="video"):
@@ -149,15 +152,8 @@ def generate_caption(title, description, caption_type="video"):
     return None
 
 # ── Download ──────────────────────────────────────────────────────────────────
-def is_presigned_url(url):
-    """Alias for clarity"""
-    return is_direct_url(url)
-
 def download_direct(url, out_path):
-    """
-    Download from presigned e2/s3/direct URLs using requests streaming.
-    Used for: IDrive e2 presigned URLs passed from the downloader.
-    """
+    """Download from presigned e2/s3/direct URLs via requests streaming."""
     send_progress("📥 Direct download (presigned URL)...")
     with requests.get(url, stream=True, timeout=3600) as r:
         r.raise_for_status()
@@ -208,12 +204,8 @@ def download_ytdlp(out_path):
     raise Exception(f"All yt-dlp strategies failed:\n{last_err[:300]}")
 
 def download_video(out_path):
-    """
-    Smart download router:
-    - Presigned/direct URL → requests streaming download
-    - Public URL (YouTube/PH/etc.) → yt-dlp
-    """
-    if is_presigned_url(VIDEO_URL):
+    """Smart download router: presigned URL → requests, public URL → yt-dlp"""
+    if is_direct_url(VIDEO_URL):
         send_progress("🔍 Detected: presigned/direct URL → requests download")
         download_direct(VIDEO_URL, out_path)
     else:
@@ -221,15 +213,11 @@ def download_video(out_path):
         download_ytdlp(out_path)
 
 def get_video_title():
-    """
-    Get title/description. For presigned URLs, skip yt-dlp (won't work).
-    """
-    if is_presigned_url(VIDEO_URL):
-        # Extract filename from URL as title
+    """Get title/description. Skip yt-dlp for presigned URLs."""
+    if is_direct_url(VIDEO_URL):
         import re
         match = re.search(r'/([^/?#]+\.mp4)', VIDEO_URL, re.IGNORECASE)
         fname = match.group(1) if match else "Video"
-        # Remove underscore/dash, clean up
         title = fname.replace(".mp4","").replace("_"," ").replace("-"," ").strip()
         return title or "Premium Video", ""
     ck = "/tmp/ph_cookies.txt" if os.path.exists("/tmp/ph_cookies.txt") else None
@@ -273,7 +261,7 @@ def smart_post_mode(size_mb, duration):
 def preflight_check():
     missing=[k for k,v in {"API_ID":API_ID,"API_HASH":API_HASH,"BOT_TOKEN":BOT_TOKEN,"VIDEO_URL":VIDEO_URL}.items() if not v or v=="0"]
     if missing: send_progress(f"❌ Missing:{', '.join(missing)}"); sys.exit(1)
-    url_type = "presigned/direct" if is_presigned_url(VIDEO_URL) else "public/yt-dlp"
+    url_type = "presigned/direct" if is_direct_url(VIDEO_URL) else "public/yt-dlp"
     send_progress(f"✅ Pre-flight OK | alias={CHANNEL_ALIAS} | url_type={url_type}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -347,30 +335,37 @@ async def main():
             send_progress(f"📤 Upload mode={mode}...")
 
             if mode=="album":
+                # Photos only album
                 if screenshots:
                     await client.send_file(CHANNEL_ID,screenshots,caption=ac(screenshots,f"📸 **{video_title}**\n\n{photo_cap}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
 
             elif mode=="both":
+                # FIX Bug 3: Photos first as album, then each video part separately
                 if screenshots:
                     await client.send_file(CHANNEL_ID,screenshots,caption=ac(screenshots,f"📸 **{video_title}**\n\n{photo_cap}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
-                for i,part in enumerate(video_parts):
-                    dp,wp,hp=get_video_info(part); sfx=f" (Part {i+1}/{len(video_parts)})" if len(video_parts)>1 else ""
-                    await client.send_file(CHANNEL_ID,part,caption=f"🎬 **{video_title}{sfx}**\n\n{video_cap}",parse_mode="markdown",
-                        thumb=thumb if i==0 else None,supports_streaming=True,
+                for i,part in enumerate(video_parts,1):
+                    dp,wp,hp=get_video_info(part); sfx=f" (Part {i}/{len(video_parts)})" if len(video_parts)>1 else ""
+                    await client.send_file(CHANNEL_ID,part,
+                        caption=f"🎬 **{video_title}{sfx}**\n\n{video_cap}" if i==1 else f"🎬 **{video_title}{sfx}**",
+                        parse_mode="markdown",thumb=thumb if i==1 else None,supports_streaming=True,
                         attributes=[types.DocumentAttributeVideo(duration=dp,w=wp,h=hp,supports_streaming=True)])
-                    send_progress(f"✅ Video part {i+1}/{len(video_parts)}")
+                    send_progress(f"✅ Video part {i}/{len(video_parts)}")
 
             elif mode=="video":
-                all_files=screenshots+[video_parts[0]]
-                await client.send_file(CHANNEL_ID,all_files,caption=ac(all_files,f"🎬 **{video_title}**\n\n{video_cap}"),parse_mode="markdown",thumb=thumb,supports_streaming=True)
-                send_progress("✅ Video+photos uploaded")
-                for i,part in enumerate(video_parts[1:],2):
-                    dp,wp,hp=get_video_info(part)
-                    await client.send_file(CHANNEL_ID,part,caption=f"🎬 **{video_title}** (Part {i}/{len(video_parts)})",parse_mode="markdown",supports_streaming=True,
+                # FIX Bug 3: Send photos as album separately, then video separately
+                # (mixing photos+video in one send_file group breaks inline playback)
+                if screenshots:
+                    await client.send_file(CHANNEL_ID,screenshots,caption=ac(screenshots,f"📸 **{video_title}**\n\n{photo_cap}"),parse_mode="markdown")
+                    send_progress("✅ Photos uploaded")
+                for i,part in enumerate(video_parts,1):
+                    dp,wp,hp=get_video_info(part); sfx=f" (Part {i}/{len(video_parts)})" if len(video_parts)>1 else ""
+                    await client.send_file(CHANNEL_ID,part,
+                        caption=f"🎬 **{video_title}{sfx}**\n\n{video_cap}" if i==1 else f"🎬 **{video_title}{sfx}**",
+                        parse_mode="markdown",thumb=thumb if i==1 else None,supports_streaming=True,
                         attributes=[types.DocumentAttributeVideo(duration=dp,w=wp,h=hp,supports_streaming=True)])
-                    send_progress(f"✅ Extra part {i}")
+                    send_progress(f"✅ Video part {i}/{len(video_parts)}")
 
         send_progress("🎉 All done!")
         sb_update_task(TASK_ID,"completed")
