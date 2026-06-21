@@ -16,7 +16,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg libsm6 libxext6
-          pip install yt-dlp==2026.6.9 opencv-python==4.13.0.92 telethon==1.44.0 requests==2.34.2 brotli curl_cffi
+          pip install yt-dlp==2026.6.9 telethon==1.44.0 requests==2.34.2 brotli curl_cffi
       - name: Run processor
         timeout-minutes: 110
         env:
