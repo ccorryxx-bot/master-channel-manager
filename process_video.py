@@ -17,7 +17,7 @@ WORKER_URL        = os.environ.get("WORKER_URL","").rstrip("/")
 WORKFLOW_NAME     = os.environ.get("WORKFLOW_NAME","V1")
 TASK_ID           = os.environ.get("TASK_ID","")
 CHANNEL_ALIAS     = os.environ.get("CHANNEL_ALIAS","default")
-PH_COOKIES_B64    = os.environ.get("PH_COOKIES_B64","")
+PH_COOKIES_B64    = os.environ.get("PH_COOKIES_B64","")  # fallback only
 
 CF_ACCOUNT_ID     = os.environ.get("CF_ACCOUNT_ID","")
 CF_AUTH_EMAIL     = os.environ.get("CF_AUTH_EMAIL","")
@@ -40,10 +40,6 @@ CHANNEL_ID = parse_channel_id(TARGET_CHANNEL_ID)
 
 # ── URL Type Detection ────────────────────────────────────────────────────────
 def is_direct_url(url):
-    """
-    Detect presigned/direct file URLs (IDrive e2, Backblaze B2, AWS S3, etc.)
-    that should be downloaded via requests instead of yt-dlp.
-    """
     import re
     if not url:
         return False
@@ -79,12 +75,6 @@ def sb_log(task_id, level, message):
 _prompt_cache = {}
 
 def get_ai_prompt(prompt_type):
-    """
-    Priority:
-    1. Supabase: channel:<CHANNEL_ALIAS>:<type>  (per-channel custom)
-    2. Supabase: default_<type>_caption           (global default)
-    3. Hardcoded fallback
-    """
     key = f"{CHANNEL_ALIAS}:{prompt_type}"
     if key in _prompt_cache:
         return _prompt_cache[key]
@@ -124,9 +114,7 @@ def send_progress(text):
     sb_log(TASK_ID,"error" if "❌" in text else "info",text[:400])
     if CHAT_ID and WORKER_URL:
         try:
-            # FIX Bug 5: use /progress endpoint
-            endpoint = f"{WORKER_URL}/progress"
-            requests.post(endpoint,json={"chat_id":CHAT_ID,"progress_text":msg,"task_id":TASK_ID},timeout=10)
+            requests.post(f"{WORKER_URL}/progress",json={"chat_id":CHAT_ID,"progress_text":msg,"task_id":TASK_ID},timeout=10)
         except Exception as e:
             print(f"[WARN] progress push failed: {e}")
 
@@ -153,7 +141,6 @@ def generate_caption(title, description, caption_type="video"):
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_direct(url, out_path):
-    """Download from presigned e2/s3/direct URLs via requests streaming."""
     send_progress("📥 Direct download (presigned URL)...")
     with requests.get(url, stream=True, timeout=3600) as r:
         r.raise_for_status()
@@ -175,16 +162,44 @@ def download_direct(url, out_path):
     send_progress(f"✅ Downloaded ({os.path.getsize(out_path)//1024//1024}MB)")
 
 def setup_cookies():
-    if not PH_COOKIES_B64: return None
-    try:
-        import base64
-        path="/tmp/ph_cookies.txt"
-        open(path,"w").write(base64.b64decode(PH_COOKIES_B64).decode())
-        send_progress("🍪 Cookies loaded"); return path
-    except Exception as e: print(f"Cookies:{e}"); return None
+    """
+    Cookies fetch priority:
+    1. Supabase (bot /updatecookies command မှ သိမ်းထားတာ)
+    2. PH_COOKIES_B64 env var (GitHub Secret fallback)
+    """
+    import base64
+    path = "/tmp/ph_cookies.txt"
+
+    # Priority 1: Supabase
+    if SUPABASE_KEY:
+        try:
+            hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/ai_prompts?name=eq.cookies:ph&limit=1",
+                headers=hdrs, timeout=10
+            )
+            rows = r.json() if r.status_code == 200 else []
+            if rows and rows[0].get("template"):
+                open(path, "w").write(base64.b64decode(rows[0]["template"]).decode())
+                send_progress("🍪 Cookies loaded (Supabase)")
+                return path
+        except Exception as e:
+            print(f"[WARN] Supabase cookies fetch: {e}")
+
+    # Priority 2: env var fallback
+    if PH_COOKIES_B64:
+        try:
+            open(path, "w").write(base64.b64decode(PH_COOKIES_B64).decode())
+            send_progress("🍪 Cookies loaded (env fallback)")
+            return path
+        except Exception as e:
+            print(f"[WARN] Cookies env: {e}")
+
+    send_progress("⚠️ No cookies found — age-restricted sites may fail")
+    return None
 
 def download_ytdlp(out_path):
-    """Download using yt-dlp for public sites (YouTube, PH, etc.)"""
+    """Download using yt-dlp (nightly) for public sites (YouTube, PH, etc.)"""
     ck = setup_cookies()
     ck_args = ["--cookies", ck] if ck else []
     base = ["yt-dlp","--merge-output-format","mp4","-o",out_path]
@@ -204,16 +219,14 @@ def download_ytdlp(out_path):
     raise Exception(f"All yt-dlp strategies failed:\n{last_err[:300]}")
 
 def download_video(out_path):
-    """Smart download router: presigned URL → requests, public URL → yt-dlp"""
     if is_direct_url(VIDEO_URL):
         send_progress("🔍 Detected: presigned/direct URL → requests download")
         download_direct(VIDEO_URL, out_path)
     else:
-        send_progress("🔍 Detected: public site → yt-dlp")
+        send_progress("🔍 Detected: public site → yt-dlp (nightly)")
         download_ytdlp(out_path)
 
 def get_video_title():
-    """Get title/description. Skip yt-dlp for presigned URLs."""
     if is_direct_url(VIDEO_URL):
         import re
         match = re.search(r'/([^/?#]+\.mp4)', VIDEO_URL, re.IGNORECASE)
@@ -286,7 +299,7 @@ async def main():
         mode     = smart_post_mode(size_mb, dur)
         send_progress(f"📊 {n_photos} photos | mode={mode} | {dur//60}min | {size_mb:.0f}MB")
 
-        # 3. AI captions (from Supabase prompt)
+        # 3. AI captions
         send_progress(f"🤖 AI captions (alias={CHANNEL_ALIAS})...")
         photo_cap = (generate_caption(video_title,video_desc,"photo") or f"📸 {video_title}") if PHOTO_CAPTION=="auto" else PHOTO_CAPTION.replace("{title}",video_title)
         video_cap = (generate_caption(video_title,video_desc,"video") or f"🎬 {video_title}") if VIDEO_CAPTION=="auto" else VIDEO_CAPTION.replace("{title}",video_title)
@@ -335,13 +348,11 @@ async def main():
             send_progress(f"📤 Upload mode={mode}...")
 
             if mode=="album":
-                # Photos only album
                 if screenshots:
                     await client.send_file(CHANNEL_ID,screenshots,caption=ac(screenshots,f"📸 **{video_title}**\n\n{photo_cap}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
 
             elif mode=="both":
-                # FIX Bug 3: Photos first as album, then each video part separately
                 if screenshots:
                     await client.send_file(CHANNEL_ID,screenshots,caption=ac(screenshots,f"📸 **{video_title}**\n\n{photo_cap}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
@@ -354,8 +365,6 @@ async def main():
                     send_progress(f"✅ Video part {i}/{len(video_parts)}")
 
             elif mode=="video":
-                # FIX Bug 3: Send photos as album separately, then video separately
-                # (mixing photos+video in one send_file group breaks inline playback)
                 if screenshots:
                     await client.send_file(CHANNEL_ID,screenshots,caption=ac(screenshots,f"📸 **{video_title}**\n\n{photo_cap}"),parse_mode="markdown")
                     send_progress("✅ Photos uploaded")
