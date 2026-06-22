@@ -134,7 +134,10 @@ def generate_caption(title, description, caption_type="video"):
             ]}, timeout=45
         )
         if r.status_code==200:
-            caption = r.json().get("result",{}).get("response","").strip()
+            result_data = r.json().get("result", {})
+            choices = result_data.get("choices", [])
+            caption = (choices[0].get("message", {}).get("content", "") if choices else "") or result_data.get("response", "")
+            caption = caption.strip() if caption else ""
             if caption: send_progress(f"✅ AI caption ({caption_type})"); return caption
     except Exception as e: send_progress(f"⚠️ AI error:{e}")
     return None
