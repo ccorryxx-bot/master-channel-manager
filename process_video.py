@@ -30,11 +30,15 @@ SUPABASE_KEY      = os.environ.get("SUPABASE_KEY","")
 MAX_FILE_SIZE_MB  = 2000
 
 def parse_channel_id(raw):
+    """Safe parse — returns 0 on error (validated inside main())."""
+    if not raw or not raw.strip():
+        return 0
     raw = raw.strip()
     try:
         return int(f"-100{raw}") if raw.isdigit() else int(raw)
     except ValueError:
-        print(f"❌ Invalid TARGET_CHANNEL_ID: '{raw}'"); sys.exit(1)
+        print(f"[WARN] Invalid TARGET_CHANNEL_ID: '{raw}'")
+        return 0
 
 CHANNEL_ID = parse_channel_id(TARGET_CHANNEL_ID)
 
@@ -277,8 +281,11 @@ def smart_post_mode(size_mb, duration):
 def preflight_check():
     missing=[k for k,v in {"API_ID":API_ID,"API_HASH":API_HASH,"BOT_TOKEN":BOT_TOKEN,"VIDEO_URL":VIDEO_URL}.items() if not v or v=="0"]
     if missing: send_progress(f"❌ Missing:{', '.join(missing)}"); sys.exit(1)
+    if not CHANNEL_ID:
+        send_progress(f"❌ TARGET_CHANNEL_ID မမှန်: '{TARGET_CHANNEL_ID}' — -100xxxxxxxxxx format ဖြစ်ရမည်")
+        sys.exit(1)
     url_type = "presigned/direct" if is_direct_url(VIDEO_URL) else "public/yt-dlp"
-    send_progress(f"✅ Pre-flight OK | alias={CHANNEL_ALIAS} | url_type={url_type}")
+    send_progress(f"✅ Pre-flight OK | alias={CHANNEL_ALIAS} | ch={CHANNEL_ID} | url_type={url_type}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
