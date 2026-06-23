@@ -193,12 +193,35 @@ def get_visual_context(screenshots):
         return "\n".join(descriptions)
     return None
 
+# ── Caption Limit Enforcement ─────────────────────────────────────────────────
+# Photo: 1 sentence → 150 chars (leaves room for title prefix in send_file)
+# Video: up to 3 sentences → 950 chars (leaves room for title prefix in send_file)
+CAPTION_LIMITS = {"photo": 150, "video": 950}
+
+def enforce_caption(caption, caption_type):
+    """Hard-cap caption to safe limit. Cuts at sentence boundary if possible."""
+    if not caption:
+        return caption
+    limit = CAPTION_LIMITS.get(caption_type, 950)
+    if len(caption) <= limit:
+        return caption
+    cut = caption[:limit]
+    for sep in ["။", "\n", ".", " "]:
+        idx = cut.rfind(sep)
+        if idx > limit // 2:
+            cut = cut[:idx + 1]
+            break
+    trimmed = cut.strip()
+    send_progress(f"✂️ Caption trimmed: {len(caption)}→{len(trimmed)} chars ({caption_type})")
+    return trimmed
+
 # ── AI Caption ────────────────────────────────────────────────────────────────
 def generate_caption(title, description, caption_type="video", visual_desc=None):
     """
     Generate Burmese social media caption using CF AI (Gemma).
-    If visual_desc is provided (from LLaVA screenshot analysis),
-    it is injected into the prompt for content-aware captions.
+    caption_type="photo" → 1 short sentence (150 chars max)
+    caption_type="video" → up to 3 sentences (950 chars max)
+    Visual frame analysis injected when available for content-aware captions.
     """
     if not CF_ACCOUNT_ID or not CF_AUTH_KEY:
         return None
@@ -212,12 +235,16 @@ def generate_caption(title, description, caption_type="video", visual_desc=None)
             f"[Metadata]\n{user_prompt}"
         )
 
+    # Tell AI explicitly which caption type to generate — removes ambiguity
+    task_line = "WRITE A PHOTO CAPTION (1 sentence only):" if caption_type == "photo" else "WRITE A VIDEO CAPTION (max 3 sentences):"
+    user_prompt = f"{task_line}\n\n{user_prompt}"
+
     try:
         r = requests.post(
             f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_AI_MODEL}",
             headers={"X-Auth-Email":CF_AUTH_EMAIL,"X-Auth-Key":CF_AUTH_KEY,"Content-Type":"application/json"},
             json={"messages":[
-                {"role":"system","content":"You are a Burmese social media content writer. Use the video frame analysis to write more specific, engaging captions."},
+                {"role":"system","content":"You are a Burmese adult content Telegram copywriter. Follow the TASK instruction exactly — write only the specified caption type, nothing else."},
                 {"role":"user","content":user_prompt}
             ]}, timeout=45
         )
@@ -226,8 +253,10 @@ def generate_caption(title, description, caption_type="video", visual_desc=None)
             choices = result_data.get("choices", [])
             caption = (choices[0].get("message", {}).get("content", "") if choices else "") or result_data.get("response", "")
             caption = caption.strip() if caption else ""
+            # Hard enforce limit — AI doesn't always count chars perfectly
+            caption = enforce_caption(caption, caption_type)
             mode = "vision+text" if visual_desc else "text-only"
-            if caption: send_progress(f"✅ AI caption ({caption_type}, {mode})"); return caption
+            if caption: send_progress(f"✅ AI caption ({caption_type}, {mode}, {len(caption)}chars)"); return caption
     except Exception as e: send_progress(f"⚠️ AI error:{e}")
     return None
 
