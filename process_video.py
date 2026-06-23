@@ -23,6 +23,7 @@ CF_ACCOUNT_ID     = os.environ.get("CF_ACCOUNT_ID","")
 CF_AUTH_EMAIL     = os.environ.get("CF_AUTH_EMAIL","")
 CF_AUTH_KEY       = os.environ.get("CF_AUTH_KEY","")
 CF_AI_MODEL       = os.environ.get("CF_AI_MODEL","@cf/aisingapore/gemma-sea-lion-v4-27b-it")
+CF_VISION_MODEL   = "@cf/llava-1.5-7b-hf"
 
 SUPABASE_URL      = "https://guotpdwaswaybjiiezax.supabase.co"
 SUPABASE_KEY      = os.environ.get("SUPABASE_KEY","")
@@ -124,18 +125,99 @@ def send_progress(text):
         except Exception as e:
             print(f"[WARN] progress push failed: {e}")
 
+# ── Vision Analysis (Screenshot → CF AI LLaVA) ───────────────────────────────
+def analyze_screenshot_vision(path):
+    """
+    Send a video frame screenshot to CF AI LLaVA vision model.
+    Returns English visual description string, or None on failure.
+    Falls back gracefully — caption generation still works without it.
+    """
+    if not CF_ACCOUNT_ID or not CF_AUTH_KEY:
+        return None
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        with open(path, "rb") as f:
+            image_bytes = list(f.read())
+        r = requests.post(
+            f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_VISION_MODEL}",
+            headers={"X-Auth-Email": CF_AUTH_EMAIL, "X-Auth-Key": CF_AUTH_KEY, "Content-Type": "application/json"},
+            json={
+                "image": image_bytes,
+                "prompt": (
+                    "Describe this video frame in 2-3 sentences. "
+                    "Focus on: people present, their actions/expressions, setting/location, mood/atmosphere, "
+                    "and any key visual details that would help write an engaging social media caption."
+                ),
+                "max_tokens": 200
+            },
+            timeout=30
+        )
+        if r.status_code == 200:
+            result = r.json().get("result", {})
+            desc = result.get("description", "").strip()
+            if desc:
+                print(f"[INFO] Vision: {desc[:120]}...")
+                return desc
+        else:
+            print(f"[WARN] Vision API {r.status_code}: {r.text[:150]}")
+    except Exception as e:
+        print(f"[WARN] Vision analysis failed: {e}")
+    return None
+
+def get_visual_context(screenshots):
+    """
+    Pick 2 key frames from screenshots list and analyze with vision model.
+    Returns combined visual description string.
+    Uses frames at ~33% and ~66% through the video for good coverage.
+    """
+    if not screenshots:
+        return None
+    n = len(screenshots)
+    # Pick 2 representative frames (skip first/last which may be less interesting)
+    picks = []
+    if n == 1:
+        picks = [screenshots[0]]
+    elif n == 2:
+        picks = screenshots
+    else:
+        picks = [screenshots[n // 3], screenshots[2 * n // 3]]
+
+    descriptions = []
+    for i, path in enumerate(picks, 1):
+        desc = analyze_screenshot_vision(path)
+        if desc:
+            descriptions.append(f"Frame {i}: {desc}")
+
+    if descriptions:
+        return "\n".join(descriptions)
+    return None
+
 # ── AI Caption ────────────────────────────────────────────────────────────────
-def generate_caption(title, description, caption_type="video"):
+def generate_caption(title, description, caption_type="video", visual_desc=None):
+    """
+    Generate Burmese social media caption using CF AI (Gemma).
+    If visual_desc is provided (from LLaVA screenshot analysis),
+    it is injected into the prompt for content-aware captions.
+    """
     if not CF_ACCOUNT_ID or not CF_AUTH_KEY:
         return None
     prompt_template = get_ai_prompt(caption_type)
-    user_prompt = prompt_template.replace("{title}",title or "N/A").replace("{description}",(description or "N/A")[:400])
+    user_prompt = prompt_template.replace("{title}", title or "N/A").replace("{description}", (description or "N/A")[:400])
+
+    # Inject visual frame analysis if available — improves caption quality
+    if visual_desc:
+        user_prompt = (
+            f"[Video Frame Analysis]\n{visual_desc}\n\n"
+            f"[Metadata]\n{user_prompt}"
+        )
+
     try:
         r = requests.post(
             f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_AI_MODEL}",
             headers={"X-Auth-Email":CF_AUTH_EMAIL,"X-Auth-Key":CF_AUTH_KEY,"Content-Type":"application/json"},
             json={"messages":[
-                {"role":"system","content":"You are a Burmese social media content writer."},
+                {"role":"system","content":"You are a Burmese social media content writer. Use the video frame analysis to write more specific, engaging captions."},
                 {"role":"user","content":user_prompt}
             ]}, timeout=45
         )
@@ -144,7 +226,8 @@ def generate_caption(title, description, caption_type="video"):
             choices = result_data.get("choices", [])
             caption = (choices[0].get("message", {}).get("content", "") if choices else "") or result_data.get("response", "")
             caption = caption.strip() if caption else ""
-            if caption: send_progress(f"✅ AI caption ({caption_type})"); return caption
+            mode = "vision+text" if visual_desc else "text-only"
+            if caption: send_progress(f"✅ AI caption ({caption_type}, {mode})"); return caption
     except Exception as e: send_progress(f"⚠️ AI error:{e}")
     return None
 
@@ -311,12 +394,7 @@ async def main():
         mode     = smart_post_mode(size_mb, dur)
         send_progress(f"📊 {n_photos} photos | mode={mode} | {dur//60}min | {size_mb:.0f}MB")
 
-        # 3. AI captions
-        send_progress(f"🤖 AI captions (alias={CHANNEL_ALIAS})...")
-        photo_cap = (generate_caption(video_title,video_desc,"photo") or f"📸 {video_title}") if PHOTO_CAPTION=="auto" else PHOTO_CAPTION.replace("{title}",video_title)
-        video_cap = (generate_caption(video_title,video_desc,"video") or f"🎬 {video_title}") if VIDEO_CAPTION=="auto" else VIDEO_CAPTION.replace("{title}",video_title)
-
-        # 4. Screenshots
+        # 3. Screenshots first — needed for vision-based caption analysis
         send_progress(f"📸 Capturing {n_photos} screenshots...")
         if dur>0:
             capture_screenshot(raw_video,dur*0.08,thumbnail)
@@ -325,7 +403,22 @@ async def main():
                 if capture_screenshot(raw_video,pos,path): screenshots.append(path)
         send_progress(f"✅ {len(screenshots)} screenshots ready")
 
-        # 5. Watermark / encode
+        # 4. Vision analysis — analyze 2 key frames for better caption context
+        visual_desc = None
+        if screenshots and CF_ACCOUNT_ID and CF_AUTH_KEY:
+            send_progress("👁 Analyzing video frames (vision AI)...")
+            visual_desc = get_visual_context(screenshots)
+            if visual_desc:
+                send_progress(f"✅ Visual context ready ({len(visual_desc)} chars)")
+            else:
+                send_progress("⚠️ Vision analysis skipped — using title only")
+
+        # 5. AI captions — now with visual context injected
+        send_progress(f"🤖 AI captions (alias={CHANNEL_ALIAS})...")
+        photo_cap = (generate_caption(video_title,video_desc,"photo",visual_desc=visual_desc) or f"📸 {video_title}") if PHOTO_CAPTION=="auto" else PHOTO_CAPTION.replace("{title}",video_title)
+        video_cap = (generate_caption(video_title,video_desc,"video",visual_desc=visual_desc) or f"🎬 {video_title}") if VIDEO_CAPTION=="auto" else VIDEO_CAPTION.replace("{title}",video_title)
+
+        # 6. Watermark / encode
         try:
             ref_h=height if height>0 else 720; bar_h=max(40,int(ref_h*0.07)); fs=max(18,int(bar_h*0.55)); ty=max(4,(bar_h-fs)//2)
             sc=",scale=-2:1080" if height>=1080 else (",scale=-2:720" if height>=720 else ",scale=trunc(iw/2)*2:trunc(ih/2)*2")
@@ -336,7 +429,7 @@ async def main():
         except Exception as e:
             send_progress(f"⚠️ Encode skip:{e}"); final_video=raw_video
 
-        # 6. Split if > 2GB
+        # 7. Split if > 2GB
         video_parts=[final_video]
         fsz=os.path.getsize(final_video)/1024/1024
         if fsz>MAX_FILE_SIZE_MB:
@@ -348,7 +441,7 @@ async def main():
                 video_parts.append(pf)
             send_progress(f"✅ Split {n} parts")
 
-        # 7. Telethon upload
+        # 8. Telethon upload
         send_progress("🚀 Connecting Telegram...")
         client=TelegramClient("bot_session",int(API_ID),API_HASH,connection_retries=None,request_retries=5)
         await client.start(bot_token=BOT_TOKEN)
