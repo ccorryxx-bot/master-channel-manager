@@ -194,15 +194,38 @@ def get_visual_context(screenshots):
     return None
 
 # ── Caption Limit Enforcement ─────────────────────────────────────────────────
-# Photo: 1 sentence → 150 chars (leaves room for title prefix in send_file)
-# Video: up to 3 sentences → 950 chars (leaves room for title prefix in send_file)
+# Fallback defaults — overridden by # CHAR_LIMIT: NNN in Supabase prompt
 CAPTION_LIMITS = {"photo": 150, "video": 950}
 
-def enforce_caption(caption, caption_type):
-    """Hard-cap caption to safe limit. Cuts at sentence boundary if possible."""
+def parse_char_limit(prompt_template, caption_type):
+    """
+    Read # CHAR_LIMIT: NNN from Supabase prompt template.
+    Prompt ထဲကနေ limit ပြောင်းလဲလို့ရ — code မထိရတော့ဘူး။
+    Example prompt line:  # CHAR_LIMIT: 200
+    Falls back to CAPTION_LIMITS defaults if directive not found.
+    """
+    import re
+    if prompt_template:
+        m = re.search(r'#\s*CHAR_LIMIT\s*:\s*(\d+)', prompt_template)
+        if m:
+            limit = int(m.group(1))
+            print(f"[INFO] CHAR_LIMIT from prompt: {limit} ({caption_type})")
+            return limit
+    return CAPTION_LIMITS.get(caption_type, 950)
+
+def strip_meta_directives(prompt_template):
+    """Remove # CHAR_LIMIT: lines before sending to AI — AI doesn't need to see them."""
+    import re
+    if not prompt_template:
+        return prompt_template
+    return re.sub(r'#\s*CHAR_LIMIT\s*:\s*\d+[ \t]*\n?', '', prompt_template).strip()
+
+def enforce_caption(caption, caption_type, limit=None):
+    """Hard-cap caption at limit. Cuts at sentence boundary (။ . newline space) if possible."""
     if not caption:
         return caption
-    limit = CAPTION_LIMITS.get(caption_type, 950)
+    if limit is None:
+        limit = CAPTION_LIMITS.get(caption_type, 950)
     if len(caption) <= limit:
         return caption
     cut = caption[:limit]
@@ -212,21 +235,26 @@ def enforce_caption(caption, caption_type):
             cut = cut[:idx + 1]
             break
     trimmed = cut.strip()
-    send_progress(f"✂️ Caption trimmed: {len(caption)}→{len(trimmed)} chars ({caption_type})")
+    send_progress(f"✂️ Caption trimmed: {len(caption)}→{len(trimmed)} chars ({caption_type}, limit={limit})")
     return trimmed
 
 # ── AI Caption ────────────────────────────────────────────────────────────────
 def generate_caption(title, description, caption_type="video", visual_desc=None):
     """
     Generate Burmese social media caption using CF AI (Gemma).
-    caption_type="photo" → 1 short sentence (150 chars max)
-    caption_type="video" → up to 3 sentences (950 chars max)
-    Visual frame analysis injected when available for content-aware captions.
+    caption_type="photo" → 1 short sentence
+    caption_type="video" → up to 3 sentences
+    Char limit: read from prompt's # CHAR_LIMIT directive, fallback to CAPTION_LIMITS.
     """
     if not CF_ACCOUNT_ID or not CF_AUTH_KEY:
         return None
     prompt_template = get_ai_prompt(caption_type)
-    user_prompt = prompt_template.replace("{title}", title or "N/A").replace("{description}", (description or "N/A")[:400])
+
+    # Parse char limit from prompt BEFORE stripping (directive gets removed before AI sees it)
+    char_limit = parse_char_limit(prompt_template, caption_type)
+    prompt_clean = strip_meta_directives(prompt_template)
+
+    user_prompt = prompt_clean.replace("{title}", title or "N/A").replace("{description}", (description or "N/A")[:400])
 
     # Inject visual frame analysis if available — improves caption quality
     if visual_desc:
@@ -253,10 +281,10 @@ def generate_caption(title, description, caption_type="video", visual_desc=None)
             choices = result_data.get("choices", [])
             caption = (choices[0].get("message", {}).get("content", "") if choices else "") or result_data.get("response", "")
             caption = caption.strip() if caption else ""
-            # Hard enforce limit — AI doesn't always count chars perfectly
-            caption = enforce_caption(caption, caption_type)
+            # Hard enforce limit from prompt directive (or fallback default)
+            caption = enforce_caption(caption, caption_type, limit=char_limit)
             mode = "vision+text" if visual_desc else "text-only"
-            if caption: send_progress(f"✅ AI caption ({caption_type}, {mode}, {len(caption)}chars)"); return caption
+            if caption: send_progress(f"✅ AI caption ({caption_type}, {mode}, {len(caption)}/{char_limit}chars)"); return caption
     except Exception as e: send_progress(f"⚠️ AI error:{e}")
     return None
 
@@ -444,8 +472,16 @@ async def main():
 
         # 5. AI captions — now with visual context injected
         send_progress(f"🤖 AI captions (alias={CHANNEL_ALIAS})...")
-        photo_cap = (generate_caption(video_title,video_desc,"photo",visual_desc=visual_desc) or f"📸 {video_title}") if PHOTO_CAPTION=="auto" else PHOTO_CAPTION.replace("{title}",video_title)
-        video_cap = (generate_caption(video_title,video_desc,"video",visual_desc=visual_desc) or f"🎬 {video_title}") if VIDEO_CAPTION=="auto" else VIDEO_CAPTION.replace("{title}",video_title)
+        if PHOTO_CAPTION == "auto":
+            photo_cap = generate_caption(video_title, video_desc, "photo", visual_desc=visual_desc) or f"📸 {video_title}"
+        else:
+            # Custom caption from bot — still enforce limit for safety
+            photo_cap = enforce_caption(PHOTO_CAPTION.replace("{title}", video_title), "photo")
+        if VIDEO_CAPTION == "auto":
+            video_cap = generate_caption(video_title, video_desc, "video", visual_desc=visual_desc) or f"🎬 {video_title}"
+        else:
+            # Custom caption from bot — still enforce limit for safety
+            video_cap = enforce_caption(VIDEO_CAPTION.replace("{title}", video_title), "video")
 
         # 6. Watermark / encode
         try:
